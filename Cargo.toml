@@ -8,7 +8,10 @@ build = "build.rs"
 anyhow = "1.0.95"
 chrono = "0.4.39"
 clap = { version = "4.5.23", features = ["derive"] }
+directories = "6.0.0"
 flexi_logger = "0.29.8"
 kamadak-exif = "0.6.1"
 log = "0.4.22"
+serde = { version = "1.0.228", features = ["derive"] }
+toml = "0.9.8"
 walkdir = "2.5.0"
