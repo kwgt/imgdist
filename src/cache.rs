@@ -8,8 +8,8 @@
 //! キャッシュデータベースを扱うモジュール
 //!
 
-use std::fs::{read_dir, File, Metadata};
-use std::io::{BufRead, BufReader};
+use std::fs::{File, Metadata};
+use std::io::BufReader;
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -18,7 +18,7 @@ use anyhow::{anyhow, Result};
 use chrono::{DateTime, Local, TimeZone, Utc};
 use exif::{Exif, Tag};
 use fnv::FnvHasher;
-use log::warn;
+use log::{debug, warn};
 use redb::{Database, TableDefinition, TypeName, Value};
 use serde::{Deserialize, Serialize};
 use std::hash::Hasher;
@@ -26,7 +26,7 @@ use std::hash::Hasher;
 use crate::cmd_args::CacheEvalMode;
 
 /// キャッシュテーブルの定義
-const TABLE: TableDefinition<&[u8], CacheRecord> =
+const TABLE: TableDefinition<String, CacheRecord> =
     TableDefinition::new("cache");
 
 ///
@@ -308,6 +308,8 @@ impl Cache {
         let volume_id = get_volume_id(&input_path)?;
         let volume_prefix = get_volume_prefix(&input_path)?;
 
+        debug!("volume_id: {} , volume_prefix: {}", volume_id, volume_prefix.display());
+
         Ok(Self {db, eval_mode, volume_id, volume_prefix})
     }
 
@@ -356,7 +358,7 @@ impl Cache {
             let table = txn.open_table(TABLE)?;
             let key = build_key(&self.volume_id, &rel_path);
 
-            Ok(table.get(key.as_slice())?.map(|data| data.value()))
+            Ok(table.get(&key)?.map(|data| data.value()))
         }
     }
 
@@ -378,13 +380,12 @@ impl Cache {
             let mut table = txn.open_table(TABLE)?;
             let key = build_key(&self.volume_id, &rel_path);
 
-            table.insert(key.as_slice(), data)?;
+            table.insert(&key, data)?;
         }
 
         txn.commit()?;
         Ok(())
     }
-
 
     ///
     /// キャッシュをモードに応じて評価し、必要ならハンドルを返す
@@ -433,10 +434,10 @@ impl Cache {
         }
 
         // Missの場合はここまで来る
+        println!("come {}", line!());
 
         let (exif, record) = if let Some(info) = info {
             (info.0, CacheRecord::new(mtime, meta.len(), info.1)?)
-
         } else {
             let exif = read_exif(path)?;
             let summary = ExifSummary::from(&exif);
@@ -451,11 +452,12 @@ impl Cache {
 }
 
 /// キーを構築する
-fn build_key(volume_id: &str, rel_path: &Path) -> Vec<u8> {
-    let mut key = volume_id.as_bytes().to_vec();
-    key.push(0);
-    key.extend(rel_path.to_string_lossy().as_bytes());
-    key
+fn build_key(volume_id: &str, rel_path: &Path) -> String {
+    format!("{}:{}", volume_id, rel_path.display())
+    //let mut key = volume_id.as_bytes().to_vec();
+    //key.push(0);
+    //key.extend(rel_path.to_string_lossy().as_bytes());
+    //key
 }
 
 
@@ -503,6 +505,8 @@ where
 {
     #[cfg(target_os = "linux")]
     {
+        use std::fs::read_dir;
+
         let (mount_point, source, dev_id) = linux_mount_info(path.as_ref())?;
         let mut candidates: Vec<PathBuf> = Vec::new();
 
@@ -615,22 +619,19 @@ where
         let wide: Vec<u16> = volume_root.as_os_str().encode_wide().chain([0]).collect();
 
         let mut serial: u32 = 0;
-        let mut dummy_max_comp_len = 0;
-        let mut file_system_flags = 0;
+        let mut dummy_max_comp_len: u32 = 0;
+        let mut file_system_flags: u32 = 0;
 
-        let ok = unsafe {
+        if unsafe {
             GetVolumeInformationW(
                 PCWSTR(wide.as_ptr()),
-                None,
                 None,
                 Some(&mut serial),
                 Some(&mut dummy_max_comp_len),
                 Some(&mut file_system_flags),
                 None,
             )
-        };
-
-        if ok.as_bool() {
+        }.is_ok() {
             Ok(format!("{:08X}", serial))
         } else {
             Err(anyhow!("volume id is not available"))
@@ -679,24 +680,22 @@ where
 
     #[cfg(target_os = "windows")]
     {
-        use windows::core::PWSTR;
+        use windows::core::PCWSTR;
         use windows::Win32::Storage::FileSystem::GetVolumePathNameW;
         use std::os::windows::ffi::OsStrExt;
 
-        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        let wide: Vec<u16> = path.as_ref().as_os_str().encode_wide().chain([0]).collect();
         let mut buffer = vec![0u16; 260];
 
         unsafe {
             if GetVolumePathNameW(
-                PWSTR(wide.as_ptr() as *mut _),
-                PWSTR(buffer.as_mut_ptr()),
-                buffer.len() as u32,
-            )
-            .as_bool()
+                PCWSTR(wide.as_ptr() as *mut _),
+                &mut buffer,
+            ).is_ok()
             {
                 let end = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
                 let s = String::from_utf16_lossy(&buffer[..end]);
-                return Ok(PathBuf::from(s));
+                return Ok(PathBuf::from(s).canonicalize()?);
             }
         }
 

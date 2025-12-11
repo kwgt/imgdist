@@ -200,7 +200,6 @@ where
     match cache.evaluate(path, meta)? {
         CacheDecision::Hit => {
             info!("skip processed file: {}", path.display());
-            return Ok(());
         }
 
         CacheDecision::Miss {handle, exif} => {
@@ -213,21 +212,26 @@ where
             };
 
             // 日付範囲のチェック
-            if !is_date_in_range(&datetime, &opts) {
+            if is_date_in_range(&datetime, &opts) {
+                // ファイルタイプと保存先パスを構築
+                if let Some(file_type) = build_file_type(
+                    &ext,
+                    &datetime,
+                    &opts
+                ) {
+                    distribute(path, file_type)?;
+                }
+
+            } else {
                 debug!(
                     "skipping {} (date {} is out of range)",
                     path.display(),
                     datetime.date_naive()
                 );
-
-                return Ok(());
             }
 
-            // ファイルタイプと保存先パスを構築
-            if let Some(file_type) = build_file_type(&ext, &datetime, &opts) {
-                distribute(path, file_type)?;
-                cache.commit(handle)?;
-            }
+            // ここまで到達したらキャッシュデータをコミット
+            cache.commit(handle)?;
         }
     }
 
