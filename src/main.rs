@@ -37,6 +37,7 @@ enum FileType {
     Raw(PathBuf),
 }
 
+///
 /// 拡張子からRAWファイルかどうかを判定する
 ///
 /// # 引数
@@ -44,6 +45,7 @@ enum FileType {
 ///
 /// # 戻り値
 /// RAWファイルの場合は`true`、そうでなければ`false`
+///
 fn is_raw_file(ext: &str) -> bool {
     matches!(ext.to_lowercase().as_str(), 
         "dng" |
@@ -61,6 +63,7 @@ fn is_raw_file(ext: &str) -> bool {
     )
 }
 
+///
 /// 拡張子からファイルタイプと保存先パスを構築する
 ///
 /// # 引数
@@ -71,6 +74,7 @@ fn is_raw_file(ext: &str) -> bool {
 ///
 /// # 戻り値
 /// 判定されたファイルタイプと保存先パス、または`None`（サポートされていない形式）
+///
 fn build_file_type(ext: &str, datetime: &DateTime<Local>, opts: &Options)
     -> Option<FileType>
 {

@@ -434,7 +434,6 @@ impl Cache {
         }
 
         // Missの場合はここまで来る
-        println!("come {}", line!());
 
         let (exif, record) = if let Some(info) = info {
             (info.0, CacheRecord::new(mtime, meta.len(), info.1)?)
@@ -454,10 +453,6 @@ impl Cache {
 /// キーを構築する
 fn build_key(volume_id: &str, rel_path: &Path) -> String {
     format!("{}:{}", volume_id, rel_path.display())
-    //let mut key = volume_id.as_bytes().to_vec();
-    //key.push(0);
-    //key.extend(rel_path.to_string_lossy().as_bytes());
-    //key
 }
 
 
