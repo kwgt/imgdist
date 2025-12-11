@@ -9,9 +9,9 @@
 //!
 
 mod cmd_args;
+mod cache;
 
-use std::fs::File;
-use std::io::BufReader;
+use std::fs::Metadata;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,9 +19,10 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use chrono::TimeZone;
 use chrono::{DateTime, Local, NaiveDateTime};
-use exif::{Exif, Tag, Field};
+use exif::{Exif, Field, Tag};
 use walkdir::{DirEntry, WalkDir};
 
+use crate::cache::{Cache, CacheDecision};
 use crate::cmd_args::Options;
 
 #[allow(unused_imports)]
@@ -116,11 +117,6 @@ fn main() {
         },
     };
 
-    if opts.is_show_options() {
-        opts.show_options();
-        std::process::exit(0);
-    }
-
     /*
      * 実行関数の呼び出し
      */
@@ -141,6 +137,8 @@ fn main() {
 /// `Err()`でラップして返す。
 ///
 fn run(opts: Arc<Options>) -> Result<()> {
+    let cache = opts.cache();
+
     for entry in WalkDir::new(opts.input_path())
         .into_iter()
         .filter_entry(|e| !is_shadow(e))
@@ -148,7 +146,12 @@ fn run(opts: Arc<Options>) -> Result<()> {
     {
         if entry.file_type().is_file() {
             if let Some(_) = entry.path().extension() {
-                if let Err(err) = process_file(entry.path(), &opts) {
+                if let Err(err) = process_file(
+                    entry.path(),
+                    entry.metadata()?,
+                    &opts,
+                    cache.as_ref(),
+                ) {
                     error!("{}", err);
                 }
             }
@@ -160,33 +163,14 @@ fn run(opts: Arc<Options>) -> Result<()> {
 
 fn is_shadow(entry: &DirEntry) -> bool {
     if let Some(name) = entry.file_name().to_str() {
-        if name.starts_with("._") {
-            return true;
-        }
-
-        if name == ".DS_Store" {
-            return true;
-        }
-
-        if name == ".AppleDouble" {
-            return true;
-        }
-
-        if name == ".Trashes" {
-            return true;
-        }
-
-        if name == ".Spotlight-V100" {
-            return true;
-        }
-
-        if name == ".fseventsd" {
-            return true;
-        }
-
-        if name == ".TemporaryItems" {
-            return true;
-        }
+        return name.starts_with("._") || matches!(name, 
+            ".DS_Store"       |
+            ".AppleDouble"    |
+            ".Trashes"        |
+            ".Spotlight-V100" |
+            ".fseventsd"      |
+            ".TemporaryItems"
+        );
     }
 
     return false;
@@ -195,48 +179,58 @@ fn is_shadow(entry: &DirEntry) -> bool {
 /// ファイルを処理する（ファイルタイプ判定とパス構築を含む）
 ///
 /// # 引数
-/// * `src` - 処理するファイルのパス
+/// * `path` - 処理するファイルのパス
 /// * `opts` - オプション設定の参照
 ///
 /// # 戻り値
 /// 処理が成功した場合は`Ok(())`、失敗した場合はエラー情報を `Err()`でラップして
 /// 返す
-fn process_file(src: impl AsRef<Path>, opts: &Options) -> Result<()> {
-    let src = src.as_ref();
+fn process_file<P>(path: P, meta: Metadata, opts: &Options, cache: &Cache,)
+    -> Result<()>
+where 
+    P: AsRef<Path>
+{
+    let path = path.as_ref();
     
-    // 拡張子を取得
-    let ext = match src.extension() {
+    let ext = match path.extension() {
         Some(ext) => ext.to_string_lossy(),
         None => return Ok(()), // 拡張子がない場合はスキップ
     };
-    
-    // Exif情報を読み取り
-    let exif = read_exif(src)?;
-    
-    // 撮影日時を取得
-    let datetime = if let Some(field) = get_datetime_field(&exif) {
-        parse_datetime(&(field.display_value().to_string()))?
-    } else {
-        warn!("not contained datetime info in {}", src.display());
-        return Ok(());
-    };
-    
-    // 日付範囲のチェック
-    if !is_date_in_range(&datetime, &opts) {
-        debug!(
-            "skipping {} (date {} is out of range)",
-            src.display(),
-            datetime.date_naive()
-        );
 
-        return Ok(());
+    match cache.evaluate(path, meta)? {
+        CacheDecision::Hit => {
+            info!("skip processed file: {}", path.display());
+            return Ok(());
+        }
+
+        CacheDecision::Miss {handle, exif} => {
+            // 撮影日時を取得
+            let datetime = if let Some(field) = get_datetime_field(&exif) {
+                parse_datetime(&(field.display_value().to_string()))?
+            } else {
+                warn!("not contained datetime info in {}", path.display());
+                return Ok(());
+            };
+
+            // 日付範囲のチェック
+            if !is_date_in_range(&datetime, &opts) {
+                debug!(
+                    "skipping {} (date {} is out of range)",
+                    path.display(),
+                    datetime.date_naive()
+                );
+
+                return Ok(());
+            }
+
+            // ファイルタイプと保存先パスを構築
+            if let Some(file_type) = build_file_type(&ext, &datetime, &opts) {
+                distribute(path, file_type)?;
+                cache.commit(handle)?;
+            }
+        }
     }
-    
-    // ファイルタイプと保存先パスを構築
-    if let Some(file_type) = build_file_type(&ext, &datetime, &opts) {
-        distribute(src, file_type)?;
-    }
-    
+
     Ok(())
 }
 
@@ -318,18 +312,6 @@ fn distribute(src: impl AsRef<Path>, file_type: FileType) -> Result<()> {
     Ok(())
 }
 
-fn read_exif(path: impl AsRef<Path>) -> Result<Exif> {
-    let mut bufreader = BufReader::new(File::open(path.as_ref())?);
-
-    match exif::Reader::new().read_from_container(&mut bufreader) {
-        Ok(exif_data) => Ok(exif_data),
-        Err(err) => Err(anyhow!(
-            "read exif failed {}: {}",
-            path.as_ref().display(),
-            err
-        )),
-    }
-}
 
 fn parse_datetime(s: &str) -> Result<DateTime<Local>> {
     match NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
