@@ -33,6 +33,7 @@ use log::{debug, error, info, trace, warn};
 enum FileType {
     /// JPEGファイル（保存先パス）
     Jpeg(PathBuf),
+
     /// RAWファイル（保存先パス）
     Raw(PathBuf),
 }
@@ -81,22 +82,23 @@ fn build_file_type(ext: &str, datetime: &DateTime<Local>, opts: &Options)
     let ext_lower = ext.to_lowercase();
     let year = datetime.format("%Y").to_string();
     let date = datetime.format("%Y%m%d").to_string();
-    let jpeg_output = opts.output_path();
-    let raw_output = opts.raw_output_path();
     
     match ext_lower.as_str() {
         "jpg" | "jpeg" => {
-            Some(FileType::Jpeg(jpeg_output.join(year).join(date)))
+            let path = opts.output_path()
+                .join(year)
+                .join(date);
+
+            Some(FileType::Jpeg(path))
         },
 
         _ if is_raw_file(&ext_lower) => {
-            let base_path = if let Some(raw_dir) = raw_output {
-                raw_dir.join(year).join(date)
-            } else {
-                jpeg_output.join(year).join(date)
-            };
+            let path = opts.raw_output_path()
+                 .unwrap_or_else(|| opts.output_path())
+                 .join(year)
+                 .join(date);
 
-            Some(FileType::Raw(base_path))
+            Some(FileType::Raw(path))
         },
 
         _ => None,
@@ -201,13 +203,20 @@ where
         None => return Ok(()), // 拡張子がない場合はスキップ
     };
 
+    /*
+     * キャッシュの評価 (処理済みか否かの判定)
+     */
     match cache.evaluate(path, meta)? {
-        CacheDecision::Hit => {
-            info!("skip processed file: {}", path.display());
-        }
+        // キャッシュにヒットする場合は処理済みのファイル(または、以前処理したと
+        // きからファイルの状態は変化無し)なのでスキップ
+        CacheDecision::Hit => info!("skip processed file: {}", path.display()),
 
+        // キャッシュにミスした場合は未処理ファイル(または、以前処理したときから
+        // ファイルの状態は変化あり)なので処理対象とする。
         CacheDecision::Miss {handle, exif} => {
-            // 撮影日時を取得
+            /*
+             * 撮影日時を取得
+             */
             let datetime = if let Some(field) = get_datetime_field(&exif) {
                 parse_datetime(&(field.display_value().to_string()))?
             } else {
@@ -215,7 +224,9 @@ where
                 return Ok(());
             };
 
-            // 日付範囲のチェック
+            /*
+             * 日付範囲のチェック
+             */
             if is_date_in_range(&datetime, &opts) {
                 // ファイルタイプと保存先パスを構築
                 if let Some(file_type) = build_file_type(
@@ -234,7 +245,9 @@ where
                 );
             }
 
-            // ここまで到達したらキャッシュデータをコミット
+            /*
+             * キャッシュデータをコミット
+             */
             cache.commit(handle)?;
         }
     }

@@ -408,43 +408,61 @@ impl Cache {
         let abs_path = path.as_ref().canonicalize()?;
         let rel_path = abs_path.strip_prefix(&self.volume_prefix)?;
         let mtime = format_iso8601(meta.modified()?)?;
-        let mut info = None;
 
+        // Exif情報の取り置きを行う変数
+        let mut reserve = None;
+
+        /*
+         * キャッシュ情報を読み出してファイルの更新状況を判断
+         *   ヒット→変化無し
+         *   ミス→変化有り
+         */
         match self.get_cache_record(&rel_path)? {
             Some(data) => {
+                // キャッシュデータがある場合はヒットかミスかを判断
                 if data.file_size == meta.len() && data.mtime == mtime {
-                    if self.eval_mode == CacheEvalMode::Strict {
-                        let exif = read_exif(&path)?;
-                        let summary = ExifSummary::from(&exif);
+                    match self.eval_mode {
+                        // Shallowの場合は、サイズとmtimeの一致のみでヒット
+                        CacheEvalMode::Shallow => return Ok(CacheDecision::Hit),
 
-                        if summary.calc_hash() == data.exif.calc_hash() {
-                            return Ok(CacheDecision::Hit);
+                        // Strictの場合はサイズとmtimeの一致に加え、Exif情報の
+                        // 一致で判断
+                        CacheEvalMode::Strict => {
+                            // Exifを読み出してハッシュ値をチェック
+                            let (exif, summary) = read_exif(&path)?;
+                            if summary.calc_hash() == data.exif.calc_hash() {
+                                return Ok(CacheDecision::Hit);
+                            }
+
+                            // ここに到達した場合は、キャッシュミスなので新情報
+                            // で更新する。せっかく読み出したExifなので取り置き
+                            // しておき後で使う。
+                            reserve = Some((exif, summary));
                         }
-
-                        info = Some((exif, summary));
-
-                    } else {
-                        return Ok(CacheDecision::Hit);
                     }
                 }
-
             }
 
-            None => {}
+            None => {
+                // キャッシュデータが存在しない場合はミスと判断
+            }
         }
 
-        // Missの場合はここまで来る
+        /*
+         * キャッシュミスの場合のフォールバック (キャッシュ情報を更新)
+         */
 
-        let (exif, record) = if let Some(info) = info {
-            (info.0, CacheRecord::new(mtime, meta.len(), info.1)?)
-        } else {
-            let exif = read_exif(path)?;
-            let summary = ExifSummary::from(&exif);
-
-            (exif, CacheRecord::new(mtime, meta.len(), summary)?)
+        // 既に読み出していたexif情報がある場合はそれを利用、読み出していない
+        // 場合は新規で読み出す。
+        let (exif, summary) = match reserve {
+            Some(reserve) => reserve,
+            None => read_exif(path)?,
         };
 
-        let handle = self.build_handle(rel_path.to_path_buf(), record)?;
+        let handle = self.build_handle(
+            rel_path.to_path_buf(), 
+            CacheRecord::new(mtime, meta.len(), summary)?,
+        )?;
 
         return Ok(CacheDecision::Miss {handle, exif});
     }
@@ -454,7 +472,6 @@ impl Cache {
 fn build_key(volume_id: &str, rel_path: &Path) -> String {
     format!("{}:{}", volume_id, rel_path.display())
 }
-
 
 /// SystemTimeを秒単位に切り詰める
 fn truncate_system_time(time: SystemTime) -> Result<SystemTime> {
@@ -498,6 +515,9 @@ fn get_volume_id<P>(path: P) -> Result<String>
 where 
     P: AsRef<Path>,
 {
+    /*
+     * Linuxの場合はファイルシステムUUIDを使う (/dev/disk/by-uuid/のUUID)
+     */
     #[cfg(target_os = "linux")]
     {
         use std::fs::read_dir;
@@ -552,10 +572,15 @@ where
         Err(anyhow!("filesystem UUID not found for {}", mount_point.display()))
     }
 
+    /*
+     * macOSの場合はVolume UUID
+     */
     #[cfg(target_os = "macos")]
     {
-        use libc::{attrlist, getattrlist, ATTR_BIT_MAP_COUNT, ATTR_VOL_INFO,
-            ATTR_VOL_UUID};
+        use libc::{
+            attrlist, getattrlist, ATTR_BIT_MAP_COUNT, ATTR_VOL_INFO,
+            ATTR_VOL_UUID
+        };
         use std::ffi::CString;
         use std::mem::{size_of, zeroed};
 
@@ -594,6 +619,9 @@ where
         Ok(format_uuid(buf.uuid))
     }
 
+    /*
+     * その他のUNIX系
+     */
     #[cfg(all(not(target_os = "linux"), not(target_os = "macos"),
         target_family = "unix"))]
     {
@@ -604,14 +632,20 @@ where
         Ok(format!("{:x}:{:x}", fsid.val[0], fsid.val[1]))
     }
 
+    /*
+     * Windowsの場合はボリュームシリアル番号を用いる
+     */
     #[cfg(target_family = "windows")]
     {
         use std::os::windows::ffi::OsStrExt;
         use windows::core::PCWSTR;
         use windows::Win32::Storage::FileSystem::GetVolumeInformationW;
 
-        let volume_root = get_volume_prefix(path)?;
-        let wide: Vec<u16> = volume_root.as_os_str().encode_wide().chain([0]).collect();
+        let volume_root: Vec<u16> = get_volume_prefix(path)?
+            .as_os_str()
+            .encode_wide()
+            .chain([0])
+            .collect();
 
         let mut serial: u32 = 0;
         let mut dummy_max_comp_len: u32 = 0;
@@ -619,7 +653,7 @@ where
 
         if unsafe {
             GetVolumeInformationW(
-                PCWSTR(wide.as_ptr()),
+                PCWSTR(volume_root.as_ptr()),
                 None,
                 Some(&mut serial),
                 Some(&mut dummy_max_comp_len),
@@ -781,7 +815,17 @@ fn decode_mount_path(s: &str) -> String {
 #[cfg(target_os = "macos")]
 fn format_uuid(uuid: [u8; 16]) -> String {
     format!(
-        "{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+        concat!(
+            "{:02X}{:02X}{:02X}{:02X}",
+            "-",
+            "{:02X}{:02X}",
+            "-",
+            "{:02X}{:02X}",
+            "-",
+            "{:02X}{:02X}",
+            "-",
+            "{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+        )
         uuid[0], uuid[1], uuid[2], uuid[3],
         uuid[4], uuid[5],
         uuid[6], uuid[7],
@@ -791,22 +835,26 @@ fn format_uuid(uuid: [u8; 16]) -> String {
 }
 
 ///
-/// Exifを読み込む
+/// Exifを読み込む。またサマリ情報を作成し一緒に返す
 ///
 /// # 引数
 /// * `path` - 対象パス
 ///
 /// # 戻り値
-/// 読み込んだExif情報
+/// 読み込んだExif情報とサマリ情報をパックしたタプルを返す
 ///
-fn read_exif<P>(path: P) -> Result<Exif>
+fn read_exif<P>(path: P) -> Result<(Exif, ExifSummary)>
 where 
     P: AsRef<Path>,
 {
     let mut bufreader = BufReader::new(File::open(&path)?);
 
     match exif::Reader::new().read_from_container(&mut bufreader) {
-        Ok(exif_data) => Ok(exif_data),
+        Ok(exif) => {
+            let summary = ExifSummary::from(&exif);
+            Ok((exif, summary))
+        }
+
         Err(err) => Err(anyhow!(
             "read exif failed {}: {}",
             path.as_ref().display(),
