@@ -9,6 +9,8 @@
 //!
 
 use std::fs::{File, Metadata};
+#[cfg(target_os = "linux")]
+use std::io::BufRead;
 use std::io::BufReader;
 
 use std::path::{Path, PathBuf};
