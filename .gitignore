@@ -1,0 +1,5 @@
+/dist/
+/target/
+/.release-skill-backups/
+/.agents
+/.release.toml
